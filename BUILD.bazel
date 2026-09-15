@@ -547,6 +547,7 @@ cc_library(
         "src/brpc/policy/thrift_protocol.cpp",
         "src/brpc/event_dispatcher_epoll.cpp",
         "src/brpc/event_dispatcher_kqueue.cpp",
+        "src/brpc/details/flatbuffers_impl.cpp",
     ]) + select({
         "//bazel/config:brpc_with_thrift": glob([
             "src/brpc/thrift*.cpp",
