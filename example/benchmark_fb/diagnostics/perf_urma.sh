@@ -17,7 +17,7 @@
 set -euo pipefail
 
 if (( $# < 2 || $# > 4 )); then
-    echo "Usage: $0 server|client <server IPv4> [URMA port] [TCP port]" >&2
+    echo "Usage: $0 server|client|client-latency <server IPv4> [URMA port] [TCP port]" >&2
     echo "       $0 server-tcp|client-tcp <server IPv4> [TCP port]" >&2
     exit 2
 fi
@@ -27,13 +27,13 @@ urma_port=${3:-8931}
 tcp_port=${4:-8932}
 budget_minutes=57
 case "$role" in
-    server|client) ;;
+    server|client|client-latency) ;;
     server-tcp|client-tcp)
         (( $# <= 3 )) || exit 2
         tcp_port=${3:-8933}
         budget_minutes=45
         ;;
-    *) echo 'Choose server, client, server-tcp or client-tcp' >&2; exit 2 ;;
+    *) echo 'Choose server, client, client-latency, server-tcp or client-tcp' >&2; exit 2 ;;
 esac
 server=build-bench-roll/benchmark_fb_server
 client=build-bench-roll/benchmark_fb_client
@@ -86,6 +86,13 @@ fi
 deadline=$((SECONDS + budget_minutes * 60))
 common=(--allow_remote --connection_type=single --thread_num=1 --attachment_size=0
         --timeout_ms=70000)
+warmup=5
+duration=20
+if [[ $role == client-latency ]]; then
+    warmup=3
+    duration=10
+    common+=(--full_call_latency)
+fi
 sizes=(32 64 256 1024 2048 4096 8192 16384 65536 262144 1048576 2097152 4194304 8388608)
 printf 'mode\tbytes\tround\texit\tpath\n' >"$out/status.tsv"
 
@@ -100,7 +107,7 @@ run_case() {
         tcp-*) port=$tcp_port; transport=(--use_urma=false); path=tcp ;;
     esac
     timeout -k 4s 80s "$client" --server="$host:$port" "${common[@]}" "${transport[@]}" \
-        --protocol="$protocol" --request_size="$bytes" --warmup_s=5 --duration_s=20 --v=0 \
+        --protocol="$protocol" --request_size="$bytes" --warmup_s="$warmup" --duration_s="$duration" --v=0 \
         >"$file.log" 2>&1 &
     pid=$!
     while kill -0 "$pid" 2>/dev/null; do
@@ -134,6 +141,9 @@ for round in 1 2 3; do
         client:3) order=(tcp-fb urma-fb urma-pb) ;;
         client-tcp:2) order=(tcp-pb tcp-fb) ;;
         client-tcp:*) order=(tcp-fb tcp-pb) ;;
+        client-latency:1) order=(urma-fb urma-pb tcp-fb tcp-pb) ;;
+        client-latency:2) order=(tcp-pb tcp-fb urma-pb urma-fb) ;;
+        client-latency:3) order=(urma-pb urma-fb tcp-pb tcp-fb) ;;
     esac
     for bytes in "${sizes[@]}"; do
         if [[ $role == client-tcp ]]; then
@@ -147,7 +157,7 @@ for round in 1 2 3; do
     done
 done
 
-python3 - "$out" "$role" "${sizes[@]}" <<'PY'
+python3 - "$out" "$role" "$duration" "${sizes[@]}" <<'PY'
 import csv
 import json
 from pathlib import Path
@@ -155,6 +165,9 @@ from statistics import median
 import sys
 
 root = Path(sys.argv[1])
+duration = int(sys.argv[3])
+sizes = sys.argv[4:]
+latency_matrix = sys.argv[2] == "client-latency"
 tcp_only = sys.argv[2] == "client-tcp"
 candidate = "tcp-fb" if tcp_only else "urma-fb"
 baselines = ("tcp-pb",) if tcp_only else ("urma-pb", "tcp-fb")
@@ -168,9 +181,39 @@ with (root / "status.tsv").open() as status:
             if not line.startswith('{"mode":"timed"'):
                 continue
             row = json.loads(line)
-            if (row["seconds"] >= 19.5 and row["requests"] > 0 and row["failures"] == 0
-                    and row["thread_num"] == row["started_threads"] == 1):
+            if (row["seconds"] >= duration - 0.5 and row["requests"] > 0 and row["failures"] == 0
+                    and row["thread_num"] == row["started_threads"] == 1
+                    and (not latency_matrix or row.get("latency_scope") == "app_round_trip")):
                 eligible[mode, size, round_id] = row
+
+if latency_matrix:
+    path = root / "communication.tsv"
+    with path.open("w") as output:
+        report = csv.writer(output, delimiter="\t", lineterminator="\n")
+        percentiles = ("p50_us", "p90_us", "p99_us", "p999_us")
+        report.writerow(["bytes", "transport", "codec", "pairs", "samples",
+                         "avg_us", "min_us", *(f"{k}_round_median" for k in percentiles),
+                         "max_us"])
+        for size in sizes:
+            for transport in ("urma", "tcp"):
+                matched_rounds = [
+                    round_id for round_id in ("1", "2", "3")
+                    if all((f"{transport}-{codec}", size, round_id) in eligible
+                           for codec in ("fb", "pb"))
+                ]
+                for codec in ("fb", "pb"):
+                    runs = [eligible[f"{transport}-{codec}", size, r] for r in matched_rounds]
+                    samples = sum(run["requests"] for run in runs)
+                    if samples:
+                        avg = sum(run["avg_us"] * run["requests"] for run in runs) / samples
+                        metrics = [f"{avg:.1f}", min(run["min_us"] for run in runs),
+                                   *(median(run[key] for run in runs) for key in percentiles),
+                                   max(run["max_us"] for run in runs)]
+                    else:
+                        metrics = ["NA"] * 7
+                    report.writerow([size, transport, codec, f"{len(runs)}/3", samples, *metrics])
+    print(f"{len(eligible)} usable runs. Report: {path}")
+    sys.exit(0)
 
 with (root / "benefit.tsv").open("w") as output:
     report = csv.writer(output, delimiter="\t", lineterminator="\n")
@@ -179,7 +222,7 @@ with (root / "benefit.tsv").open("w") as output:
                         for mode in ("tcp-fb", "tcp-pb")] if tcp_only else []
     report.writerow(["bytes", "baseline", "pairs", "qps_change", "p50_reduction",
                      "p99_reduction", *absolute_columns])
-    for size in sys.argv[3:]:
+    for size in sizes:
         for baseline in baselines:
             pairs = []
             for round_id in ("1", "2", "3"):
@@ -199,3 +242,39 @@ with (root / "benefit.tsv").open("w") as output:
             report.writerow([size, baseline, f"{len(pairs)}/3", *changes, *absolute])
 print(f"{len(eligible)} usable runs. Report: {root / 'benefit.tsv'}")
 PY
+
+if [[ $role == client-latency ]]; then
+    for bytes in "${sizes[@]}"; do
+        for protocol in fb_rpc baidu_std; do
+            file="$out/codec-$protocol-$bytes.log"
+            if ! "$client" --protocol="$protocol" --request_size="$bytes" --codec_iterations=300 \
+                    >"$file" 2>&1; then
+                echo "Codec measurement failed. See $file" >&2
+                exit 1
+            fi
+        done
+    done
+    python3 - "$out" "${sizes[@]}" <<'PY'
+import csv
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+path = root / "codec.tsv"
+with path.open("w") as output:
+    report = csv.writer(output, delimiter="\t", lineterminator="\n")
+    fields = ("request_size", "protocol", "direction", "stage", "layout",
+              "samples", "avg_ns", "min_ns", "p50_ns", "p99_ns", "max_ns")
+    report.writerow(["bytes", *fields[1:]])
+    for size in sys.argv[2:]:
+        for protocol in ("fb_rpc", "baidu_std"):
+            rows = [json.loads(line)
+                    for line in (root / f"codec-{protocol}-{size}.log").read_text().splitlines()
+                    if line.startswith('{"mode":"codec"')]
+            if len(rows) != 6 or any(row["samples"] != 300 for row in rows):
+                raise RuntimeError(f"Unexpected codec sample count for {protocol}, {size} B")
+            report.writerows([row[key] for key in fields] for row in rows)
+print(f"Report: {path}")
+PY
+fi

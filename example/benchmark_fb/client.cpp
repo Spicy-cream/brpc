@@ -31,6 +31,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <vector>
 #include "butil/config.h"
 #include "butil/endpoint.h"
@@ -58,6 +59,8 @@ DEFINE_int32(request_count, 16, "Count mode: total requests across all threads, 
 DEFINE_int32(duration_s, 0, "0 selects count mode; 1..3600 runs a timed benchmark");
 DEFINE_int32(warmup_s, 0, "Timed mode: unmeasured warm-up seconds, 0..600");
 DEFINE_int32(thread_num, 2, "Concurrent synchronous callers: 1..16, or 1..1024 when timed");
+DEFINE_bool(full_call_latency, false, "Time request construction through response parsing and schema verification");
+DEFINE_int32(codec_iterations, 0, "Run local request/response codec measurements instead of RPC, 1..10000");
 DEFINE_int32(request_size, 64, "Bytes in the optional request string, 0..8388608");
 DEFINE_int32(attachment_size, 0, "Bytes in the echoed attachment, 0..1048576");
 DEFINE_int32(timeout_ms, 1500, "Per-RPC timeout, 1..70000 milliseconds");
@@ -76,6 +79,11 @@ using Clock = std::chrono::steady_clock;
 
 // Result of one RPC: kSuccess, kRejected (expected schema rejection) or kFailed.
 enum CallResult { kSuccess, kRejected, kFailed };
+template <typename Unit>
+int64_t Elapsed(Clock::time_point begin) {
+    return std::chrono::duration_cast<Unit>(Clock::now() - begin).count();
+}
+
 // Arguments: request ID, timeout in ms, RPC latency in us (out), error (out).
 using CallFn = std::function<CallResult(uint64_t, int64_t, int64_t*, std::string*)>;
 
@@ -105,9 +113,6 @@ Message MakeRequest(uint64_t request_id, const std::string& text) {
 bool CheckResponse(const Message& response, uint64_t request_id,
                    const std::string& text, const butil::IOBuf& attachment,
                    const brpc::Controller& cntl) {
-    if (!response.Verify<benchmark_fb::Response>()) {
-        return false;
-    }
     const auto* output = response.GetRoot<benchmark_fb::Response>();
     if (output->request_id() != request_id ||
         output->attachment_size() != attachment.size() ||
@@ -173,13 +178,15 @@ struct Shared {
 
 // Builds one synchronous RPC for the selected protocol. Both protocols carry
 // the same request string and attachment and verify every echoed byte. Only
-// the RPC itself is timed, not building the request or checking the reply.
+// the RPC itself is timed by default; full-call timing includes construction
+// and schema validation. The echo comparison is outside either interval.
 CallFn MakeCall(brpc::Channel* channel, const std::string& text,
                 const butil::IOBuf& attachment) {
     if (FLAGS_protocol == "baidu_std") {
         auto stub = std::make_shared<benchmark_fb_pb::BenchmarkService_Stub>(channel);
         return [stub, &text, &attachment](uint64_t request_id, int64_t timeout_ms,
                                           int64_t* latency_us, std::string* error) {
+            auto begin = FLAGS_full_call_latency ? Clock::now() : Clock::time_point{};
             benchmark_fb_pb::Request request;
             request.set_request_id(request_id);
             if (!FLAGS_omit_message) {
@@ -189,10 +196,11 @@ CallFn MakeCall(brpc::Channel* channel, const std::string& text,
             brpc::Controller cntl;
             cntl.set_timeout_ms(timeout_ms);
             cntl.request_attachment().append(attachment);
-            const auto begin = Clock::now();
+            if (!FLAGS_full_call_latency) {
+                begin = Clock::now();
+            }
             stub->Echo(&cntl, &request, &response, nullptr);
-            *latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                Clock::now() - begin).count();
+            *latency_us = Elapsed<std::chrono::microseconds>(begin);
             if (cntl.Failed()) {
                 *error = "RPC failed: code=" + std::to_string(cntl.ErrorCode()) +
                          " source_port=" + std::to_string(cntl.local_side().port) +
@@ -211,15 +219,19 @@ CallFn MakeCall(brpc::Channel* channel, const std::string& text,
     auto stub = std::make_shared<benchmark_fb::BenchmarkService::Stub>(channel);
     return [stub, &text, &attachment](uint64_t request_id, int64_t timeout_ms,
                                       int64_t* latency_us, std::string* error) {
+        auto begin = FLAGS_full_call_latency ? Clock::now() : Clock::time_point{};
         const Message request = MakeRequest(request_id, text);
         Message response;
         brpc::Controller cntl;
         cntl.set_timeout_ms(timeout_ms);
         cntl.request_attachment().append(attachment);
-        const auto begin = Clock::now();
+        if (!FLAGS_full_call_latency) {
+            begin = Clock::now();
+        }
         stub->Echo(&cntl, &request, &response, nullptr);
-        *latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
-            Clock::now() - begin).count();
+        if (!FLAGS_full_call_latency) {
+            *latency_us = Elapsed<std::chrono::microseconds>(begin);
+        }
         if (FLAGS_corrupt_request) {
             // The generated dispatcher rejects the schema through the generic
             // RpcController::SetFailed(string), which is -1 on the wire today.
@@ -239,7 +251,11 @@ CallFn MakeCall(brpc::Channel* channel, const std::string& text,
                          " " + cntl.ErrorText();
             return kFailed;
         }
-        if (!CheckResponse(response, request_id, text, attachment, cntl)) {
+        const bool verified = response.Verify<benchmark_fb::Response>();
+        if (FLAGS_full_call_latency) {
+            *latency_us = Elapsed<std::chrono::microseconds>(begin);
+        }
+        if (!verified || !CheckResponse(response, request_id, text, attachment, cntl)) {
             *error = "FlatBuffers response mismatch source_port=" +
                      std::to_string(cntl.local_side().port);
             return kFailed;
@@ -361,19 +377,22 @@ double CpuSeconds() {
         (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6;
 }
 
-// Per-caller latency histogram in microseconds with fixed memory, however
-// long the run. Values below 128 are exact; larger ones fall into 128 buckets
-// per power of two, so a percentile is reported at most 1/128 above the
-// recorded value. Average and maximum are exact.
+// Fixed-memory latency histogram, in microseconds for RPCs and nanoseconds
+// for local codecs. Values below 128 are exact. Larger values use 128
+// buckets per power of two, so a percentile is reported at most 1/128
+// above the recorded value. Mean, minimum and maximum use the raw samples.
 class LatencyHistogram {
 public:
     LatencyHistogram() : _counts(kBuckets, 0) {}
 
-    void Add(uint32_t us) {
-        ++_counts[IndexOf(us)];
+    void Add(int64_t duration) {
+        const auto sample = static_cast<uint32_t>(
+            std::min<int64_t>(duration, UINT32_MAX));
+        ++_counts[IndexOf(sample)];
         ++_count;
-        _sum += us;
-        _max = std::max(_max, us);
+        _sum += sample;
+        _min = std::min(_min, sample);
+        _max = std::max(_max, sample);
     }
 
     void Merge(const LatencyHistogram& other) {
@@ -382,11 +401,13 @@ public:
         }
         _count += other._count;
         _sum += other._sum;
+        _min = std::min(_min, other._min);
         _max = std::max(_max, other._max);
     }
 
     uint64_t count() const { return _count; }
     double average() const { return _count ? _sum / _count : 0; }
+    uint32_t min() const { return _count ? _min : 0; }
     uint32_t max() const { return _max; }
 
     // Nearest-rank percentile, reported as the upper bound of its bucket.
@@ -431,6 +452,7 @@ private:
     std::vector<uint64_t> _counts;
     uint64_t _count = 0;
     double _sum = 0;
+    uint32_t _min = UINT32_MAX;
     uint32_t _max = 0;
 };
 
@@ -500,8 +522,7 @@ int RunTimed(const CallFn& call) {
                 continue;
             }
             if (measured && !stop.load(std::memory_order_relaxed)) {
-                histogram.Add(static_cast<uint32_t>(
-                    std::min<int64_t>(latency_us, UINT32_MAX)));
+                histogram.Add(latency_us);
             }
         }
     });
@@ -530,7 +551,10 @@ int RunTimed(const CallFn& call) {
               << ",\"failures\":" << failures.load()
               << ",\"qps\":" << qps
               << ",\"payload_mib_per_s\":" << qps * payload / (1024.0 * 1024.0)
+              << ",\"latency_scope\":\""
+              << (FLAGS_full_call_latency ? "app_round_trip" : "stub_call") << "\""
               << ",\"avg_us\":" << all.average()
+              << ",\"min_us\":" << all.min()
               << ",\"p50_us\":" << all.Percentile(0.50)
               << ",\"p90_us\":" << all.Percentile(0.90)
               << ",\"p99_us\":" << all.Percentile(0.99)
@@ -542,6 +566,132 @@ int RunTimed(const CallFn& call) {
     // A run with fewer callers than requested is not a valid benchmark.
     return !shared.failed.load() && failures.load() == 0 &&
            started_threads == FLAGS_thread_num && all.count() > 0 ? 0 : 1;
+}
+
+void PrintCodec(const char* direction, const char* stage, const char* layout,
+                const LatencyHistogram& stats) {
+    std::cout << "{\"mode\":\"codec\",\"protocol\":\"" << FLAGS_protocol
+              << "\",\"request_size\":" << FLAGS_request_size
+              << ",\"direction\":\"" << direction << "\",\"stage\":\"" << stage
+              << "\",\"layout\":\"" << layout << "\",\"samples\":" << stats.count()
+              << ",\"avg_ns\":" << stats.average()
+              << ",\"min_ns\":" << stats.min()
+              << ",\"p50_ns\":" << stats.Percentile(0.50)
+              << ",\"p99_ns\":" << stats.Percentile(0.99)
+              << ",\"max_ns\":" << stats.max() << "}\n";
+}
+
+// Both codecs receive the same backing layout. Preparing the receive buffer
+// and checking the decoded value for correctness stay outside the timer.
+template <typename Encode, typename Decode>
+bool MeasureCodec(const char* direction, Encode encode, Decode decode) {
+    constexpr size_t kUrmaFragment = 4064;
+    constexpr int kWarmup = 16;
+    LatencyHistogram encode_stats;
+    butil::IOBuf sample;
+    for (int i = -kWarmup; i < FLAGS_codec_iterations; ++i) {
+        butil::IOBuf wire;
+        const auto begin = Clock::now();
+        if (!encode(&wire)) {
+            return false;
+        }
+        const auto elapsed = Elapsed<std::chrono::nanoseconds>(begin);
+        if (i >= 0) {
+            encode_stats.Add(elapsed);
+        }
+        sample.swap(wire);
+    }
+    const size_t size = sample.size();
+    std::unique_ptr<char[]> bytes(new char[size]);
+    if (size == 0 || sample.copy_to(bytes.get(), size) != size) {
+        return false;
+    }
+    PrintCodec(direction, "serialize", "output_iobuf", encode_stats);
+    for (const bool contiguous : {true, false}) {
+        const size_t block = contiguous ? size : kUrmaFragment;
+        butil::IOBuf input;
+        for (size_t offset = 0; offset < size; offset += block) {
+            if (input.append_user_data(bytes.get() + offset,
+                                       std::min(block, size - offset), [](void*) {}) != 0) {
+                return false;
+            }
+        }
+        LatencyHistogram decode_stats;
+        for (int i = -kWarmup; i < FLAGS_codec_iterations; ++i) {
+            const auto elapsed = decode(input);
+            if (elapsed < 0) {
+                return false;
+            }
+            if (i >= 0) {
+                decode_stats.Add(elapsed);
+            }
+        }
+        PrintCodec(direction, "deserialize", contiguous ? "contiguous" : "chunks_4064",
+                   decode_stats);
+    }
+    return true;
+}
+
+template <typename PbMessage>
+bool MeasurePb(const char* direction, const std::string& text) {
+    return MeasureCodec(direction, [&](butil::IOBuf* wire) {
+        PbMessage value;
+        value.set_request_id(7);
+        value.set_message(text);
+        if constexpr (std::is_same<PbMessage, benchmark_fb_pb::Response>::value) {
+            value.set_attachment_size(0);
+        }
+        butil::IOBufAsZeroCopyOutputStream output(wire);
+        return value.SerializeToZeroCopyStream(&output);
+    }, [&](const butil::IOBuf& input) -> int64_t {
+        const auto begin = Clock::now();
+        PbMessage value;
+        butil::IOBufAsZeroCopyInputStream stream(input);
+        const bool ok = value.ParseFromZeroCopyStream(&stream);
+        const uint64_t id = value.request_id();
+        const auto elapsed = Elapsed<std::chrono::nanoseconds>(begin);
+        return ok && id == 7 && value.message() == text ? elapsed : -1;
+    });
+}
+
+template <typename FbTable, typename Finish>
+bool MeasureFb(const char* direction, const std::string& text, Finish finish) {
+    return MeasureCodec(direction, [&](butil::IOBuf* wire) {
+        MessageBuilder builder(text.size() + 256);
+        const auto field = builder.CreateString(text.data(), text.size());
+        builder.Finish(finish(builder, field));
+        Message value = builder.ReleaseMessage();
+        if (!value.append_msg_to_iobuf(*wire)) {
+            return false;
+        }
+        wire->pop_front(value.get_meta_size());
+        return wire->size() == value.size();
+    }, [&](const butil::IOBuf& input) -> int64_t {
+        const auto begin = Clock::now();
+        Message value;
+        if (!value.parse_msg_from_iobuf(input, input.size(), 0) || !value.Verify<FbTable>()) {
+            return -1;
+        }
+        const auto* root = value.GetRoot<FbTable>();
+        const uint64_t id = root->request_id();
+        const auto elapsed = Elapsed<std::chrono::nanoseconds>(begin);
+        const auto* field = root->message();
+        return id == 7 && field && field->size() == text.size() &&
+            memcmp(field->data(), text.data(), text.size()) == 0 ? elapsed : -1;
+    });
+}
+
+int RunCodec() {
+    const std::string text = MakeBytes(FLAGS_request_size, 31);
+    if (FLAGS_protocol == "baidu_std") {
+        return MeasurePb<benchmark_fb_pb::Request>("request", text) &&
+            MeasurePb<benchmark_fb_pb::Response>("response", text) ? 0 : 1;
+    }
+    return MeasureFb<benchmark_fb::Request>("request", text, [](auto& builder, auto field) {
+        return benchmark_fb::CreateRequest(builder, 7, field);
+    }) && MeasureFb<benchmark_fb::Response>("response", text, [](auto& builder, auto field) {
+        return benchmark_fb::CreateResponse(builder, 7, field, 0);
+    }) ? 0 : 1;
 }
 
 int RunClient(const butil::EndPoint& endpoint) {
@@ -568,6 +718,19 @@ int RunClient(const butil::EndPoint& endpoint) {
 
 int main(int argc, char* argv[]) {
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+    if (FLAGS_codec_iterations != 0) {
+        if (FLAGS_codec_iterations < 0 || FLAGS_codec_iterations > 10000 ||
+            FLAGS_request_size < 0 || FLAGS_request_size > 8 * 1024 * 1024 ||
+            (FLAGS_protocol != "fb_rpc" && FLAGS_protocol != "baidu_std")) {
+            std::cerr << "Invalid codec measurement parameters\n";
+            return 2;
+        }
+        if (RunCodec() != 0) {
+            std::cerr << "Codec measurement failed validation\n";
+            return 1;
+        }
+        return 0;
+    }
     butil::EndPoint endpoint;
     if (!ValidFlags(&endpoint)) {
         std::cerr << "Invalid flags; --server=127.0.0.1:PORT is required unless "

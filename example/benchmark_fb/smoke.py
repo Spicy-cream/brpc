@@ -98,7 +98,7 @@ def run_timed_boundary(binary, endpoint, deadline):
     command = [
         str(binary), "--server=" + endpoint, "--duration_s=2", "--warmup_s=0",
         "--thread_num=1", "--request_size=16", "--attachment_size=0",
-        "--timeout_ms=5000",
+        "--timeout_ms=5000", "--full_call_latency",
     ]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, timeout=min(10.0, remaining(deadline)), check=False)
@@ -115,8 +115,31 @@ def run_timed_boundary(binary, endpoint, deadline):
         raise RuntimeError("timed window includes in-flight calls: " + result.stdout)
     # Every reply takes at least 600 ms; the latency histogram reports
     # percentiles at most 1/128 above the recorded value.
-    if not 600000 <= report.get("p50_us", 0) <= report.get("max_us", 0) < 700000:
+    if (report.get("latency_scope") != "app_round_trip" or
+            not 600000 <= report.get("min_us", 0) <= report.get("p50_us", 0) <=
+            report.get("p99_us", 0) <= report.get("max_us", 0) < 700000 or
+            not report["min_us"] <= report["avg_us"] <= report["max_us"]):
         raise RuntimeError("unexpected timed latency: " + result.stdout)
+
+
+def run_codec(client, deadline):
+    stages = {("serialize", "output_iobuf"), ("deserialize", "contiguous"),
+              ("deserialize", "chunks_4064")}
+    for protocol in ("fb_rpc", "baidu_std"):
+        command = [str(client), "--protocol=" + protocol, "--codec_iterations=4",
+                   "--request_size=8193"]
+        result = subprocess.run(command, capture_output=True, text=True,
+                                timeout=min(10.0, remaining(deadline)), check=True)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        expected = {(direction, stage, layout) for direction in ("request", "response")
+                    for stage, layout in stages}
+        if (len(rows) != len(expected) or
+                {(row["direction"], row["stage"], row["layout"]) for row in rows} != expected or
+                any(row["mode"] != "codec" or row["protocol"] != protocol or
+                    row["request_size"] != 8193 or row["samples"] != 4 or
+                    not 0 <= row["min_ns"] <= row["p50_ns"] <= row["p99_ns"] <= row["max_ns"] or
+                    not row["min_ns"] <= row["avg_ns"] <= row["max_ns"] for row in rows)):
+            raise RuntimeError("unexpected codec latency report: " + result.stdout)
 
 
 def run_rejected_flags(binary, endpoint, deadline):
@@ -200,6 +223,7 @@ def main():
             for use_bthread in (False, True):
                 run_timed_start_failure(client, endpoint, deadline, use_bthread)
             run_rejected_flags(client, endpoint, deadline)
+            run_codec(client, deadline)
             if process.poll() is not None:
                 raise RuntimeError("server exited during the smoke")
             slow = start_server(server, server_log, "--reply_delay_ms=600")
