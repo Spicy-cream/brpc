@@ -18,16 +18,23 @@ set -euo pipefail
 
 if (( $# < 2 || $# > 4 )); then
     echo "Usage: $0 server|client <server IPv4> [URMA port] [TCP port]" >&2
+    echo "       $0 server-tcp|client-tcp <server IPv4> [TCP port]" >&2
     exit 2
 fi
 role=$1
 host=$2
-if [[ $role != server && $role != client ]]; then
-    echo 'Choose server or client' >&2
-    exit 2
-fi
 urma_port=${3:-8931}
 tcp_port=${4:-8932}
+budget_minutes=57
+case "$role" in
+    server|client) ;;
+    server-tcp|client-tcp)
+        (( $# <= 3 )) || exit 2
+        tcp_port=${3:-8933}
+        budget_minutes=45
+        ;;
+    *) echo 'Choose server, client, server-tcp or client-tcp' >&2; exit 2 ;;
+esac
 server=build-bench-roll/benchmark_fb_server
 client=build-bench-roll/benchmark_fb_client
 if [[ ! -x $server || ! -x $client ]]; then
@@ -45,30 +52,38 @@ urma=(--use_urma=true --urma_device="${BRPC_URMA_DEVICE:-bonding_dev_0}"
       --urma_max_sge=1 --urma_use_polling=false --urma_recv_zerocopy=false
       --urma_trace_wr_limit=0 --urma_trace_rolling_dir=)
 
-if [[ $role == server ]]; then
-    if [[ -n $(ss -H -ltn "sport = :$urma_port or sport = :$tcp_port") ]]; then
+if [[ $role == server || $role == server-tcp ]]; then
+    listen_filter="sport = :$tcp_port"
+    if [[ $role == server ]]; then
+        listen_filter+=" or sport = :$urma_port"
+    fi
+    if [[ -n $(ss -H -ltn "$listen_filter") ]]; then
         echo 'A benchmark port is already in use' >&2
         exit 1
     fi
-    nohup "$server" --listen_addr="$host:$urma_port" --allow_remote \
-        --duration_s=5400 --v=0 "${urma[@]}" >"$out/urma.log" 2>&1 </dev/null &
-    urma_pid=$!
     nohup "$server" --listen_addr="$host:$tcp_port" --allow_remote \
         --duration_s=5400 --v=0 --use_urma=false >"$out/tcp.log" 2>&1 </dev/null &
-    tcp_pid=$!
+    pids=("$!")
+    server_logs=("$out/tcp.log")
+    if [[ $role == server ]]; then
+        nohup "$server" --listen_addr="$host:$urma_port" --allow_remote \
+            --duration_s=5400 --v=0 "${urma[@]}" >"$out/urma.log" 2>&1 </dev/null &
+        pids+=("$!")
+        server_logs+=("$out/urma.log")
+    fi
     for attempt in {1..25}; do
-        if grep -q BRPC_FB_READY "$out/urma.log" && grep -q BRPC_FB_READY "$out/tcp.log"; then
-            grep -h BRPC_FB_READY "$out/urma.log" "$out/tcp.log"
+        if [[ $(grep -l BRPC_FB_READY "${server_logs[@]}" | wc -l) -eq ${#server_logs[@]} ]]; then
+            grep -h BRPC_FB_READY "${server_logs[@]}"
             exit 0
         fi
-        if ! kill -0 "$urma_pid" "$tcp_pid" 2>/dev/null; then break; fi
+        if ! kill -0 "${pids[@]}" 2>/dev/null; then break; fi
         sleep 1
     done
-    tail -n 6 "$out/urma.log" "$out/tcp.log"
-    kill "$urma_pid" "$tcp_pid" 2>/dev/null || true
+    tail -n 6 "${server_logs[@]}"
+    kill "${pids[@]}" 2>/dev/null || true
     exit 1
 fi
-deadline=$((SECONDS + 57 * 60))
+deadline=$((SECONDS + budget_minutes * 60))
 common=(--allow_remote --connection_type=single --thread_num=1 --attachment_size=0
         --timeout_ms=70000)
 sizes=(32 64 256 1024 2048 4096 8192 16384 65536 262144 1048576 2097152 4194304 8388608)
@@ -79,8 +94,10 @@ run_case() {
     local file="$out/$mode-$bytes-r$round"
     local transport=("${urma[@]}")
     case "$mode" in
-        urma-pb) protocol=baidu_std ;;
-        tcp-fb) port=$tcp_port; transport=(--use_urma=false); path=tcp ;;
+        *-pb) protocol=baidu_std ;;
+    esac
+    case "$mode" in
+        tcp-*) port=$tcp_port; transport=(--use_urma=false); path=tcp ;;
     esac
     timeout -k 4s 80s "$client" --server="$host:$port" "${common[@]}" "${transport[@]}" \
         --protocol="$protocol" --request_size="$bytes" --warmup_s=5 --duration_s=20 --v=0 \
@@ -111,12 +128,17 @@ run_case() {
 }
 
 for round in 1 2 3; do
-    case "$round" in
-        1) order=(urma-fb urma-pb tcp-fb) ;;
-        2) order=(urma-pb tcp-fb urma-fb) ;;
-        3) order=(tcp-fb urma-fb urma-pb) ;;
+    case "$role:$round" in
+        client:1) order=(urma-fb urma-pb tcp-fb) ;;
+        client:2) order=(urma-pb tcp-fb urma-fb) ;;
+        client:3) order=(tcp-fb urma-fb urma-pb) ;;
+        client-tcp:2) order=(tcp-pb tcp-fb) ;;
+        client-tcp:*) order=(tcp-fb tcp-pb) ;;
     esac
     for bytes in "${sizes[@]}"; do
+        if [[ $role == client-tcp ]]; then
+            order=("${order[1]}" "${order[0]}")
+        fi
         for mode in "${order[@]}"; do
             (( deadline - SECONDS >= 87 )) || break 3
             run_case "$mode" "$bytes" "$round"
@@ -125,7 +147,7 @@ for round in 1 2 3; do
     done
 done
 
-python3 - "$out" "${sizes[@]}" <<'PY'
+python3 - "$out" "$role" "${sizes[@]}" <<'PY'
 import csv
 import json
 from pathlib import Path
@@ -133,10 +155,13 @@ from statistics import median
 import sys
 
 root = Path(sys.argv[1])
+tcp_only = sys.argv[2] == "client-tcp"
+candidate = "tcp-fb" if tcp_only else "urma-fb"
+baselines = ("tcp-pb",) if tcp_only else ("urma-pb", "tcp-fb")
 eligible = {}
 with (root / "status.tsv").open() as status:
     for mode, size, round_id, rc, path in list(csv.reader(status, delimiter="\t"))[1:]:
-        if rc != "0" or path != ("tcp" if mode == "tcp-fb" else "urma_ok"):
+        if rc != "0" or path != ("tcp" if mode.startswith("tcp-") else "urma_ok"):
             continue
         log = root / f"{mode}-{size}-r{round_id}.log"
         for line in log.read_text(errors="replace").splitlines():
@@ -149,12 +174,16 @@ with (root / "status.tsv").open() as status:
 
 with (root / "benefit.tsv").open("w") as output:
     report = csv.writer(output, delimiter="\t", lineterminator="\n")
-    report.writerow(["bytes", "baseline", "pairs", "qps_change", "p50_reduction", "p99_reduction"])
-    for size in sys.argv[2:]:
-        for baseline in ("urma-pb", "tcp-fb"):
+    fields = ("qps", "p50_us", "p99_us")
+    absolute_columns = [f"{mode}_{field}" for field in fields
+                        for mode in ("tcp-fb", "tcp-pb")] if tcp_only else []
+    report.writerow(["bytes", "baseline", "pairs", "qps_change", "p50_reduction",
+                     "p99_reduction", *absolute_columns])
+    for size in sys.argv[3:]:
+        for baseline in baselines:
             pairs = []
             for round_id in ("1", "2", "3"):
-                new = eligible.get(("urma-fb", size, round_id))
+                new = eligible.get((candidate, size, round_id))
                 control = eligible.get((baseline, size, round_id))
                 if new and control:
                     pairs.append((new, control))
@@ -163,6 +192,10 @@ with (root / "benefit.tsv").open("w") as output:
                 results = [sign * (new[field] / control[field] - 1) for new, control in pairs
                            if control[field] > 0]
                 changes.append(f"{median(results):+.1%}" if results else "NA")
-            report.writerow([size, baseline, f"{len(pairs)}/3", *changes])
+            absolute = []
+            if tcp_only:
+                absolute = [f"{median(pair[index][field] for pair in pairs):.1f}" if pairs else "NA"
+                            for field in fields for index in (0, 1)]
+            report.writerow([size, baseline, f"{len(pairs)}/3", *changes, *absolute])
 print(f"{len(eligible)} usable runs. Report: {root / 'benefit.tsv'}")
 PY
