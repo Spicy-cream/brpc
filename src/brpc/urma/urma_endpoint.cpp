@@ -19,11 +19,13 @@
 
 #if BRPC_WITH_URMA
 
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -35,6 +37,7 @@
 #include <gflags/gflags.h>
 
 #include "butil/atomicops.h"
+#include "butil/crc32c.h"
 #include "butil/iobuf.h"
 #include "butil/logging.h"
 #include "butil/macros.h"
@@ -67,6 +70,34 @@ DECLARE_bool(urma_recv_zerocopy);
 DECLARE_int32(urma_zerocopy_min_size);
 DECLARE_int32(urma_prepared_jetty_cnt);
 DECLARE_bool(urma_poller_yield);
+DEFINE_uint32(urma_trace_wr_limit, 0,
+              "Fingerprint up to this number of data WRs per direction on each connection; 0 disables diagnostics");
+DEFINE_uint32(urma_trace_wr_stride, 1,
+              "Print a cumulative diagnostic fingerprint every N data WRs");
+
+DEFINE_string(urma_trace_rolling_dir, "",
+              "Existing directory for per-connection rolling diagnostic traces");
+
+static bool TraceSlotsEnabled() {
+    return FLAGS_urma_trace_wr_limit || !FLAGS_urma_trace_rolling_dir.empty();
+}
+
+static bool ShouldLogTrace(uint64_t sequence) {
+    return sequence <= 8 ||
+           sequence % std::max(1u, FLAGS_urma_trace_wr_stride) == 0;
+}
+
+static bool CheckTraceSlot(Socket* socket, const char* queue,
+                           uint64_t context, uint16_t slot) {
+    if (!TraceSlotsEnabled() || context == static_cast<uint64_t>(slot) + 1) {
+        return true;
+    }
+    LOG(ERROR) << "URMA_TRACE_ERROR kind=" << queue << "-slot expected="
+               << (static_cast<uint64_t>(slot) + 1) << " actual=" << context
+               << " on " << socket->description();
+    errno = EPROTO;
+    return false;
+}
 
 // ---- Constants shared with the handshake module ----
 static const int WAIT_TIMEOUT_MS = 50;
@@ -157,8 +188,59 @@ UrmaEndpoint::UrmaEndpoint(Socket* s)
     _input_processor.Init(s, InputMessengerProcessor::STREAM_URMA_JETTY);
 }
 
+void UrmaEndpoint::RecordTrace(TraceProgress& trace, const char* direction) {
+    if (FLAGS_urma_trace_rolling_dir.empty()) {
+        if (ShouldLogTrace(trace.wrs)) {
+            LOG(INFO) << "URMA_TRACE dir=" << direction << " seq=" << trace.wrs
+                      << " bytes=" << trace.bytes << " crc=" << trace.crc
+                      << " on " << _socket->description();
+        }
+        return;
+    }
+    if (!trace.ring_attempted) {
+        trace.ring_attempted = true;
+        std::string path = FLAGS_urma_trace_rolling_dir + "/urma-" + direction + "-XXXXXX";
+        const int fd = mkstemp(&path[0]);
+        if (fd < 0) {
+            PLOG(ERROR) << "URMA_TRACE_ERROR kind=ring-create path=" << path;
+            return;
+        }
+        const size_t length = kTraceRingSlots * sizeof(TraceRecord);
+        void* mapping = MAP_FAILED;
+        if (ftruncate(fd, length) == 0) {
+            mapping = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        }
+        const int saved_errno = errno;
+        close(fd);
+        if (mapping == MAP_FAILED) {
+            errno = saved_errno;
+            PLOG(ERROR) << "URMA_TRACE_ERROR kind=ring-map path=" << path;
+            unlink(path.c_str());
+            return;
+        }
+        trace.ring = static_cast<char*>(mapping);
+        LOG(INFO) << "URMA_TRACE_RING dir=" << direction << " path=" << path
+                  << " on " << _socket->description();
+    }
+    if (trace.ring) {
+        // Each direction has one writer. Read the file after the run ends.
+        const TraceRecord record{trace.wrs, trace.bytes, trace.crc, 0};
+        const size_t slot = (trace.wrs - 1) % kTraceRingSlots;
+        std::memcpy(trace.ring + slot * sizeof(record), &record, sizeof(record));
+    }
+}
+
+void UrmaEndpoint::CloseTraceRing(TraceProgress& trace) {
+    if (trace.ring) {
+        munmap(trace.ring, kTraceRingSlots * sizeof(TraceRecord));
+        trace.ring = nullptr;
+    }
+}
+
 UrmaEndpoint::~UrmaEndpoint() {
     DeallocateResources();
+    CloseTraceRing(_trace_sent);
+    CloseTraceRing(_trace_received);
     if (_read_butex) {
         bthread::butex_destroy(_read_butex);
         _read_butex = nullptr;
@@ -179,6 +261,12 @@ void UrmaEndpoint::Reset() {
     _sq_current = 0;
     _sq_sent = 0;
     _rq_received = 0;
+    CloseTraceRing(_trace_sent);
+    CloseTraceRing(_trace_received);
+    _trace_sent = {};
+    _trace_received = {};
+    _trace_dispatched_bytes = 0;
+    _trace_dispatched_crc = 0;
     _pending_received_bytes.store(0, butil::memory_order_relaxed);
     _input_processor.Reset();
     _sbuf.clear();
@@ -742,9 +830,20 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
         wr.flag.bs.complete_enable = 1;
         wr.tjetty = _resource->remote_jetty;
         wr.send.src = sg;
-        wr.user_ctx = 1;
-        urma_jfs_wr_t* bad_wr = nullptr;
         const uint16_t sq_slot = _sq_current;
+        wr.user_ctx = TraceSlotsEnabled() ? static_cast<uint64_t>(sq_slot) + 1 : 1;
+        urma_jfs_wr_t* bad_wr = nullptr;
+        const bool trace = !FLAGS_urma_trace_rolling_dir.empty() ||
+                           _trace_sent.wrs < FLAGS_urma_trace_wr_limit;
+        if (trace) {
+            for (size_t i = 0; i < sge_index; ++i) {
+                _trace_sent.crc = butil::crc32c::Extend(
+                    _trace_sent.crc, reinterpret_cast<const char*>(sglist[i].addr),
+                    sglist[i].len);
+            }
+            ++_trace_sent.wrs;
+            _trace_sent.bytes += this_len;
+        }
         const uint32_t local_jetty_id = _resource->jetty->jetty_id.id;
         const uint32_t remote_jetty_id = _resource->remote_jetty->id.id;
 
@@ -779,6 +878,9 @@ ssize_t UrmaEndpoint::CutFromIOBufList(butil::IOBuf** from, size_t ndata) {
             errno = rc;
             return -1;
         }
+        if (trace) {
+            RecordTrace(_trace_sent, "tx");
+        }
         VLOG(1) << "URMA posted data SEND: bytes=" << this_len
                 << " sge_count=" << sge_index << " on "
                 << _socket->description();
@@ -806,7 +908,9 @@ int UrmaEndpoint::DoPostRecv(void* block, size_t block_size) {
     urma_sge_t sge{reinterpret_cast<uint64_t>(block),
                    static_cast<uint32_t>(block_size), tseg, nullptr};
     urma_sg_t sg{&sge, 1};
-    urma_jfr_wr_t wr{sg, 0, nullptr};
+    const uint64_t context = TraceSlotsEnabled()
+        ? static_cast<uint64_t>(_rq_received) + 1 : 0;
+    urma_jfr_wr_t wr{sg, context, nullptr};
     urma_jfr_wr_t* bad = nullptr;
     // Use the shared-JFR path on every device, including bonding. The bonding
     // provider owns physical receive scheduling for the JFR; a local
@@ -958,6 +1062,9 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
             SendAck(0);
             return 0;
         }
+        if (!CheckTraceSlot(_socket, "sq", cr.user_ctx, _sq_sent)) {
+            return -1;
+        }
         const uint16_t old =
             _sq_window_size.load(butil::memory_order_acquire);
         if (old >= _local_window_capacity) {
@@ -980,6 +1087,9 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
         return 0;
     }
     // Recv completion.
+    if (!CheckTraceSlot(_socket, "rq", cr.user_ctx, _rq_received)) {
+        return -1;
+    }
     if (cr.opcode == URMA_CR_OPC_SEND_WITH_IMM && cr.imm_data > 0) {
         if (cr.imm_data > _local_window_capacity) {
             LOG(WARNING) << "Invalid URMA receive credit: " << cr.imm_data;
@@ -1025,6 +1135,15 @@ ssize_t UrmaEndpoint::HandleCompletion(const urma_cr_t& cr) {
     if (cr.completion_len < static_cast<uint32_t>(FLAGS_urma_zerocopy_min_size)) {
         zerocopy = false;
     }
+    if (cr.completion_len && (!FLAGS_urma_trace_rolling_dir.empty() ||
+                              _trace_received.wrs < FLAGS_urma_trace_wr_limit)) {
+        ++_trace_received.wrs;
+        _trace_received.bytes += cr.completion_len;
+        _trace_received.crc = butil::crc32c::Extend(
+            _trace_received.crc, static_cast<const char*>(_rbuf_data[_rq_received]),
+            cr.completion_len);
+        RecordTrace(_trace_received, "rx");
+    }
     butil::IOPortal& read_buf = _input_processor.read_buf();
     if (zerocopy) {
         _rbuf[_rq_received].cutn(&read_buf, cr.completion_len);
@@ -1056,6 +1175,34 @@ void UrmaEndpoint::DispatchReceivedBytes(SocketUniquePtr& s, ssize_t bytes) {
         0, butil::memory_order_acq_rel);
     if (pending <= 0 || s->Failed()) {
         return;
+    }
+
+    // The last pending bytes precede the parser. The traced prefix may end
+    // before the current CQ batch if the configured WR limit was reached.
+    if (_trace_received.bytes > _trace_dispatched_bytes) {
+        const auto& input = _input_processor.read_buf();
+        const size_t appended = static_cast<size_t>(pending);
+        const size_t traced = _trace_received.bytes - _trace_dispatched_bytes;
+        std::string data;
+        if (appended > input.size() || traced > appended ||
+            input.copy_to(&data, traced, input.size() - appended) != traced) {
+            LOG(ERROR) << "URMA_TRACE_ERROR kind=input-size seq=" << _trace_received.wrs
+                       << " appended=" << appended << " buffered=" << input.size()
+                       << " traced=" << traced << " on " << s->description();
+            s->SetFailed(EPROTO, "URMA trace input length mismatch");
+            return;
+        }
+        _trace_dispatched_crc = butil::crc32c::Extend(
+            _trace_dispatched_crc, data.data(), data.size());
+        _trace_dispatched_bytes += traced;
+        if (_trace_dispatched_crc != _trace_received.crc) {
+            LOG(ERROR) << "URMA_TRACE_ERROR kind=input-crc seq=" << _trace_received.wrs
+                       << " bytes=" << _trace_dispatched_bytes << " rx_crc="
+                       << _trace_received.crc << " input_crc=" << _trace_dispatched_crc
+                       << " on " << s->description();
+            s->SetFailed(EPROTO, "URMA trace input CRC mismatch");
+            return;
+        }
     }
 
     if (!s->user()) {

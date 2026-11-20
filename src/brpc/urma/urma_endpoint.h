@@ -316,6 +316,29 @@ private:
     // RQ consumer index.
     uint16_t _rq_received{0};
 
+    // Diagnostic counters are owned by the data writer or the CQ handler.
+    static constexpr size_t kTraceRingSlots = 1024;
+    struct TraceRecord {
+        uint64_t sequence;
+        uint64_t bytes;
+        uint32_t crc;
+        uint32_t reserved;
+    };
+    static_assert(sizeof(TraceRecord) == 24, "Unexpected URMA trace record layout");
+    struct TraceProgress {
+        uint64_t wrs{0};
+        uint64_t bytes{0};
+        uint32_t crc{0};
+        bool ring_attempted{false};
+        char* ring{nullptr};
+    };
+    void RecordTrace(TraceProgress& trace, const char* direction);
+    static void CloseTraceRing(TraceProgress& trace);
+    TraceProgress _trace_sent;
+    TraceProgress _trace_received;
+    uint64_t _trace_dispatched_bytes{0};
+    uint32_t _trace_dispatched_crc{0};
+
     // Butex for waking the handshake bthread parked in ReadFromFd.
     butil::atomic<int>* _read_butex{nullptr};
 

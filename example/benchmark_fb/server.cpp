@@ -76,9 +76,9 @@ public:
             return;
         }
         const auto* input = request->GetRoot<benchmark_fb::Request>();
-        if ((input->message() && input->message()->size() > kMaxBytes) ||
+        if ((input->message() && input->message()->size() > 8 * kMaxBytes) ||
             cntl->request_attachment().size() > kMaxBytes) {
-            cntl->SetFailed(brpc::EREQUEST, "Example payload limit is 1 MiB per field");
+            cntl->SetFailed(brpc::EREQUEST, "Example payload limit is 8 MiB for message and 1 MiB for attachment");
             return;
         }
         brpc::flatbuffers::MessageBuilder builder(BuilderSize(input));
@@ -103,9 +103,9 @@ public:
               google::protobuf::Closure* done) override {
         brpc::ClosureGuard done_guard(done);
         auto* cntl = static_cast<brpc::Controller*>(controller);
-        if (request->message().size() > kMaxBytes ||
+        if (request->message().size() > 8 * kMaxBytes ||
             cntl->request_attachment().size() > kMaxBytes) {
-            cntl->SetFailed(brpc::EREQUEST, "Example payload limit is 1 MiB per field");
+            cntl->SetFailed(brpc::EREQUEST, "Example payload limit is 8 MiB for message and 1 MiB for attachment");
             return;
         }
         response->set_request_id(request->request_id());

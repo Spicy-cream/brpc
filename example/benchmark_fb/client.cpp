@@ -58,9 +58,9 @@ DEFINE_int32(request_count, 16, "Count mode: total requests across all threads, 
 DEFINE_int32(duration_s, 0, "0 selects count mode; 1..3600 runs a timed benchmark");
 DEFINE_int32(warmup_s, 0, "Timed mode: unmeasured warm-up seconds, 0..600");
 DEFINE_int32(thread_num, 2, "Concurrent synchronous callers: 1..16, or 1..1024 when timed");
-DEFINE_int32(request_size, 64, "Bytes in the optional request string, 0..1048576");
+DEFINE_int32(request_size, 64, "Bytes in the optional request string, 0..8388608");
 DEFINE_int32(attachment_size, 0, "Bytes in the echoed attachment, 0..1048576");
-DEFINE_int32(timeout_ms, 1500, "Per-RPC timeout, 1..5000 milliseconds");
+DEFINE_int32(timeout_ms, 1500, "Per-RPC timeout, 1..70000 milliseconds");
 DEFINE_int32(deadline_ms, 30000, "Count mode: overall client deadline, 1..120000 milliseconds");
 DEFINE_bool(omit_message, false, "Omit the optional string rather than sending an empty string");
 DEFINE_bool(use_bthread, false, "Run callers as bthreads instead of pthreads");
@@ -154,9 +154,9 @@ bool ValidFlags(butil::EndPoint* endpoint) {
         FLAGS_warmup_s >= 0 && FLAGS_warmup_s <= 600 && (timed || FLAGS_warmup_s == 0) &&
         FLAGS_thread_num >= 1 && FLAGS_thread_num <= (timed ? 1024 : 16) &&
         FLAGS_fail_worker_start_at >= -1 && FLAGS_fail_worker_start_at < FLAGS_thread_num &&
-        FLAGS_request_size >= 0 && FLAGS_request_size <= 1024 * 1024 &&
+        FLAGS_request_size >= 0 && FLAGS_request_size <= 8 * 1024 * 1024 &&
         FLAGS_attachment_size >= 0 && FLAGS_attachment_size <= 1024 * 1024 &&
-        FLAGS_timeout_ms >= 1 && FLAGS_timeout_ms <= 5000 &&
+        FLAGS_timeout_ms >= 1 && FLAGS_timeout_ms <= 70000 &&
         FLAGS_deadline_ms >= 1 && FLAGS_deadline_ms <= 120000;
 }
 
@@ -194,11 +194,14 @@ CallFn MakeCall(brpc::Channel* channel, const std::string& text,
             *latency_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 Clock::now() - begin).count();
             if (cntl.Failed()) {
-                *error = "RPC failed: " + cntl.ErrorText();
+                *error = "RPC failed: code=" + std::to_string(cntl.ErrorCode()) +
+                         " source_port=" + std::to_string(cntl.local_side().port) +
+                         " " + cntl.ErrorText();
                 return kFailed;
             }
             if (!CheckPbResponse(response, request_id, text, attachment, cntl)) {
-                *error = "Response fields, optional string or attachment mismatch";
+                *error = "Protobuf response mismatch source_port=" +
+                         std::to_string(cntl.local_side().port);
                 return kFailed;
             }
             return kSuccess;
@@ -231,11 +234,14 @@ CallFn MakeCall(brpc::Channel* channel, const std::string& text,
             return kRejected;
         }
         if (cntl.Failed()) {
-            *error = "RPC failed: " + cntl.ErrorText();
+            *error = "RPC failed: code=" + std::to_string(cntl.ErrorCode()) +
+                         " source_port=" + std::to_string(cntl.local_side().port) +
+                         " " + cntl.ErrorText();
             return kFailed;
         }
         if (!CheckResponse(response, request_id, text, attachment, cntl)) {
-            *error = "Response schema, fields, optional string or attachment mismatch";
+            *error = "FlatBuffers response mismatch source_port=" +
+                     std::to_string(cntl.local_side().port);
             return kFailed;
         }
         return kSuccess;
@@ -481,7 +487,7 @@ int RunTimed(const CallFn& call) {
     };
     const int started_threads = RunWorkers(&shared, [&](int index) {
         LatencyHistogram& histogram = latencies[index];
-        while (!stop.load(std::memory_order_relaxed)) {
+        while (!stop.load(std::memory_order_relaxed) && !shared.failed.load()) {
             const bool measured = measuring.load(std::memory_order_relaxed);
             int64_t latency_us = 0;
             std::string error;
